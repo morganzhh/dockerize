@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,7 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
+	"github.com/thedevsaddam/gojsonq"
 )
 
 const defaultWaitRetryInterval = time.Second
@@ -57,6 +60,7 @@ var (
 	waitTimeoutFlag   time.Duration
 	dependencyChan    chan struct{}
 	noOverwriteFlag   bool
+	token             string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -111,6 +115,10 @@ func waitForDependencies() {
 				waitForSocket(u.Scheme, u.Host, waitTimeoutFlag)
 			case "unix":
 				waitForSocket(u.Scheme, u.Path, waitTimeoutFlag)
+			case "consul":
+				waitForConsul(u, false)
+			case "config":
+				waitForConfig(u)
 			case "http", "https":
 				wg.Add(1)
 				go func(u url.URL) {
@@ -144,6 +152,7 @@ func waitForDependencies() {
 						}
 					}
 				}(u)
+
 			default:
 				log.Fatalf("invalid host protocol provided: %s. supported protocols are: tcp, tcp4, tcp6 and http", u.Scheme)
 			}
@@ -159,6 +168,95 @@ func waitForDependencies() {
 		log.Fatalf("Timeout after %s waiting on dependencies to become available: %v", waitTimeoutFlag, waitFlag)
 	}
 
+}
+
+func waitForConfig(u url.URL) {
+	consulDep := fmt.Sprintf("http://%s/v1/kv/config/configloader/data?status=done", u.Host)
+	consulUrl, _ := url.Parse(consulDep)
+	waitForConsul(*consulUrl, true)
+	log.Print("Consul config dependencies loaded confirmed")
+
+	target := fmt.Sprintf("http://%s/v1/kv/config/common/data", u.Host)
+	config := getConsulConfig(target)
+	if nil != config {
+		jq := gojsonq.New(gojsonq.SetDecoder(&yamlDecoder{})).Reader(config)
+		host := jq.From(strings.Trim(u.Path, "/")).Find("host")
+		port := jq.Reset().From(strings.Trim(u.Path, "/")).Find("port")
+		var waitHost string
+		if nil == port {
+			waitHost = fmt.Sprintf("%s", host)
+		} else {
+			waitHost = fmt.Sprintf("%s:%d", host, int64(port.(float64)))
+		}
+		waitForSocket("tcp", waitHost, waitTimeoutFlag)
+	}else {
+		log.Print("Problem with dial. Could be no such configuration")
+	}
+}
+
+func waitForConsul(u url.URL, isSync bool) {
+	sync := make(chan struct{})
+	if !isSync {
+		wg.Add(1)
+		close(sync)
+	}
+	go func() {
+		if isSync {
+			defer close(sync)
+		} else {
+			defer wg.Done()
+		}
+		for {
+			url := fmt.Sprintf("http://%s%s", u.Host, u.Path)
+			config := getConsulConfig(url)
+			if nil != config {
+				jq := gojsonq.New(gojsonq.SetDecoder(&yamlDecoder{})).Reader(config)
+				query := strings.Split(u.RawQuery, "=")
+				value := jq.Find(query[0])
+				if query[1] != value {
+					log.Printf("Got %s requied %s\n", value, query[1])
+					time.Sleep(waitRetryInterval)
+				} else {
+					return
+				}
+			} else {
+				log.Printf("Problem with request: %s, Sleeping %s\n", u.String(),  waitRetryInterval)
+				time.Sleep(waitRetryInterval)
+			}
+		}
+	}()
+
+	select {
+		case <-sync:
+			break
+		case <-time.After(waitTimeoutFlag):
+			log.Fatalf("Timeout after %s waiting on Consul to become available", waitTimeoutFlag)
+	}
+}
+
+func getConsulConfig(url string) io.ReadCloser {
+	url = fmt.Sprintf("%s?raw=true", url)
+	if token != "" {
+		url = fmt.Sprintf("%s&token=%s", url, token)
+	}
+	client := &http.Client{
+		Timeout: waitTimeoutFlag,
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), waitRetryInterval)
+		return nil
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Problem with request: %s. Sleeping %s\n", err.Error(), waitRetryInterval)
+		return nil
+	} else if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp.Body
+	} else {
+		log.Printf("Received %d from %s. Sleeping %s\n", resp.StatusCode, url, waitRetryInterval)
+		return nil
+	}
 }
 
 func waitForSocket(scheme, addr string, timeout time.Duration) {
@@ -217,10 +315,11 @@ func main() {
 	flag.Var(&stderrTailFlag, "stderr", "Tails a file to stderr. Can be passed multiple times")
 	flag.StringVar(&delimsFlag, "delims", "", `template tag delimiters. default "{{":"}}" `)
 	flag.Var(&headersFlag, "wait-http-header", "HTTP headers, colon separated. e.g \"Accept-Encoding: gzip\". Can be passed multiple times")
-	flag.Var(&waitFlag, "wait", "Host (tcp/tcp4/tcp6/http/https/unix/file) to wait for before this container starts. Can be passed multiple times. e.g. tcp://db:5432")
+	flag.Var(&waitFlag, "wait", "Host (tcp/tcp4/tcp6/http/https/unix/file) to wait for before this container starts. Can be passed multiple times. " +
+			"e.g. tcp://db:5432. for consul: consul://ip:port/v1/kv/configpath?jsonpath=something, will wait jsonpath's value equal to something ")
 	flag.DurationVar(&waitTimeoutFlag, "timeout", 10*time.Second, "Host wait timeout")
 	flag.DurationVar(&waitRetryInterval, "wait-retry-interval", defaultWaitRetryInterval, "Duration to wait before retrying")
-
+	flag.StringVar(&token, "token", "", "token for consul acl")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -288,7 +387,6 @@ func main() {
 			generateFile(template, dest)
 		}
 	}
-
 	waitForDependencies()
 
 	// Setup context

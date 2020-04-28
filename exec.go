@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 func runCmd(ctx context.Context, cancel context.CancelFunc, cmd string, args ...string) {
